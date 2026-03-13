@@ -1112,6 +1112,23 @@ def process_tool_result(
     return tool_result, tool_result_files, tool_result_embeds
 
 
+def resolve_tool_name_alias(tools: dict, tool_function_name: str) -> str | None:
+    if tool_function_name in tools:
+        return tool_function_name
+
+    candidates = []
+    if tool_function_name.startswith("tool_"):
+        candidates.append(tool_function_name[len("tool_") :])
+    else:
+        candidates.append(f"tool_{tool_function_name}")
+
+    for candidate in candidates:
+        if candidate in tools:
+            return candidate
+
+    return None
+
+
 async def terminal_event_handler(
     tool_function_name: str,
     tool_function_params: dict,
@@ -1263,8 +1280,10 @@ async def chat_completion_tools_handler(
                 log.debug(f"{tool_call=}")
 
                 tool_function_name = tool_call.get("name", None)
-                if tool_function_name not in tools:
+                resolved_tool_name = resolve_tool_name_alias(tools, tool_function_name)
+                if resolved_tool_name is None:
                     return body, {}
+                tool_function_name = resolved_tool_name
 
                 tool_function_params = tool_call.get("parameters", {})
 
@@ -4304,8 +4323,35 @@ async def streaming_chat_response_handler(response, ctx):
                         tool_type = None
                         direct_tool = False
 
-                        if tool_function_name in tools:
-                            tool = tools[tool_function_name]
+                        resolved_tool_name = resolve_tool_name_alias(
+                            tools, tool_function_name
+                        )
+                        if resolved_tool_name is None and metadata.get("tool_ids"):
+                            try:
+                                refreshed_tools = await get_tools(
+                                    request,
+                                    metadata.get("tool_ids", []),
+                                    user,
+                                    {
+                                        **extra_params,
+                                        "__model__": model,
+                                        "__messages__": form_data.get("messages", []),
+                                        "__files__": metadata.get("files", []),
+                                    },
+                                )
+                                if refreshed_tools:
+                                    tools = {**tools, **refreshed_tools}
+                                    metadata["tools"] = tools
+                                    resolved_tool_name = resolve_tool_name_alias(
+                                        tools, tool_function_name
+                                    )
+                            except Exception as e:
+                                log.exception(
+                                    f"Failed to refresh tool mapping for '{tool_function_name}': {e}"
+                                )
+
+                        if resolved_tool_name is not None:
+                            tool = tools[resolved_tool_name]
                             spec = tool.get("spec", {})
 
                             tool_type = tool.get("type", "")
@@ -4330,7 +4376,7 @@ async def streaming_chat_response_handler(response, ctx):
                                             "type": "execute:tool",
                                             "data": {
                                                 "id": str(uuid4()),
-                                                "name": tool_function_name,
+                                                "name": resolved_tool_name,
                                                 "params": tool_function_params,
                                                 "server": tool.get("server", {}),
                                                 "session_id": metadata.get(
@@ -4357,6 +4403,15 @@ async def streaming_chat_response_handler(response, ctx):
 
                             except Exception as e:
                                 tool_result = str(e)
+                        else:
+                            available_tool_names = sorted(list(tools.keys()))
+                            tool_result = (
+                                f"Error: Tool '{tool_function_name}' was not resolved by OpenWebUI, "
+                                f"so no external request was sent. "
+                                f"Selected tool_ids={metadata.get('tool_ids', [])}. "
+                                f"Available tools={available_tool_names}"
+                            )
+                            log.error(tool_result)
 
                         tool_result, tool_result_files, tool_result_embeds = (
                             process_tool_result(
@@ -4431,6 +4486,18 @@ async def streaming_chat_response_handler(response, ctx):
                                 item["arguments"] = tc.get("function", {}).get(
                                     "arguments", "{}"
                                 )
+                                matching_result = next(
+                                    (
+                                        result
+                                        for result in results
+                                        if result.get("tool_call_id") == call_id
+                                    ),
+                                    None,
+                                )
+                                if matching_result and str(
+                                    matching_result.get("content", "")
+                                ).startswith("Error: Tool '"):
+                                    item["status"] = "failed"
                                 break
 
                     for result in results:
